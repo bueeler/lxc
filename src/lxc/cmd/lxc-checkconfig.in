@@ -79,7 +79,7 @@ if [ ! -f $CONFIG ]; then
     fi
 fi
 
-if gunzip -tq < $CONFIG 2>/dev/null; then
+if gunzip < $CONFIG 2>/dev/null; then
     CAT="zcat"
 fi
 
