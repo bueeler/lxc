@@ -397,7 +397,7 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 	}
 	oldv = *lastslash;
 	*lastslash = '\0';
-	fpath = must_make_path(path, "cpuset.cpus", NULL);
+	fpath = must_make_path(path, "cpus", NULL);
 	posscpus = read_file(fpath);
 	if (!posscpus) {
 		SYSERROR("Failed to read file \"%s\"", fpath);
@@ -492,7 +492,7 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 
 copy_parent:
 	*lastslash = oldv;
-	fpath = must_make_path(path, "cpuset.cpus", NULL);
+	fpath = must_make_path(path, "cpus", NULL);
 	ret = lxc_write_to_file(fpath, cpulist, strlen(cpulist), false, 0666);
 	if (cpulist == posscpus)
 		cpulist = NULL;
@@ -599,7 +599,7 @@ static bool cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
 	}
 
 	/* copy parent's settings */
-	if (!copy_parent_file(cgpath, "cpuset.mems")) {
+	if (!copy_parent_file(cgpath, "mems")) {
 		SYSERROR("Failed to copy \"cpuset.mems\" settings");
 		return false;
 	}
@@ -714,7 +714,7 @@ static char **cg_hybrid_get_controllers(char **klist, char **nlist, char *line,
 	 * verify /sys/fs/cgroup/ in this field.
 	 */
 	if (strncmp(p, "/sys/fs/cgroup/", 15) != 0) {
-		ERROR("Found hierarchy not under /sys/fs/cgroup: \"%s\"", p);
+		WARN("Found hierarchy not under /sys/fs/cgroup: \"%s\"", p);
 		return NULL;
 	}
 
@@ -2519,7 +2519,7 @@ static bool cg_hybrid_init(struct cgroup_ops *ops, bool relative,
 
 		mountpoint = cg_hybrid_get_mountpoint(line);
 		if (!mountpoint) {
-			ERROR("Failed parsing mountpoint from \"%s\"", line);
+			WARN("Failed parsing mountpoint from \"%s\"", line);
 			goto next;
 		}
 
@@ -2528,7 +2528,7 @@ static bool cg_hybrid_init(struct cgroup_ops *ops, bool relative,
 		else
 			base_cgroup = cg_hybrid_get_current_cgroup(basecginfo, NULL, CGROUP2_SUPER_MAGIC);
 		if (!base_cgroup) {
-			ERROR("Failed to find current cgroup");
+			WARN("Failed to find current cgroup");
 			goto next;
 		}
 

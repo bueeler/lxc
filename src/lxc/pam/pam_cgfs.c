@@ -1754,7 +1754,7 @@ static bool cg_filter_and_set_cpus(char *path, bool am_initialized)
 	oldv = *lastslash;
 	*lastslash = '\0';
 
-	fpath = must_make_path(path, "cpuset.cpus", NULL);
+	fpath = must_make_path(path, "cpus", NULL);
 	posscpus = read_file(fpath);
 	if (!posscpus) {
 		pam_cgfs_debug("Could not read file: %s\n", fpath);
