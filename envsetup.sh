@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Android NDK
-export NDK=/home/roland/android-ndk-r19c
+export NDK=~/android-ndk-r19c
 export HOST_TAG=linux-x86_64
 export TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/$HOST_TAG
 export SYSROOT=$TOOLCHAIN/sysroot
