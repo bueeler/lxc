@@ -608,8 +608,8 @@ static bool fetch_seccomp(struct lxc_container *c, lxc_attach_options_t *options
 
 	if (!(options->namespaces & CLONE_NEWNS) ||
 	    !(options->attach_flags & LXC_ATTACH_LSM)) {
-		free(c->lxc_conf->seccomp);
-		c->lxc_conf->seccomp = NULL;
+		free(c->lxc_conf->seccomp.seccomp);
+		c->lxc_conf->seccomp.seccomp = NULL;
 		return true;
 	}
 
@@ -852,12 +852,18 @@ static int attach_child_main(struct attach_clone_payload *payload)
 	}
 
 	if (init_ctx->container && init_ctx->container->lxc_conf &&
-	    init_ctx->container->lxc_conf->seccomp) {
-		ret = lxc_seccomp_load(init_ctx->container->lxc_conf);
+	    init_ctx->container->lxc_conf->seccomp.seccomp) {
+		struct lxc_conf *conf = init_ctx->container->lxc_conf;
+
+		ret = lxc_seccomp_load(conf);
 		if (ret < 0)
 			goto on_error;
 
 		TRACE("Loaded seccomp profile");
+
+		ret = lxc_seccomp_send_notifier_fd(&conf->seccomp, payload->ipc_socket);
+		if (ret < 0)
+			goto on_error;
 	}
 
 	close(payload->ipc_socket);
@@ -1002,9 +1008,9 @@ static inline void lxc_attach_terminal_close_log(struct lxc_terminal *terminal)
 	close_prot_errno_disarm(terminal->log_fd);
 }
 
-int lxc_attach(const char *name, const char *lxcpath,
-	       lxc_attach_exec_t exec_function, void *exec_payload,
-	       lxc_attach_options_t *options, pid_t *attached_process)
+int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+	       void *exec_payload, lxc_attach_options_t *options,
+	       pid_t *attached_process)
 {
 	int i, ret, status;
 	int ipc_sockets[2];
@@ -1014,6 +1020,7 @@ int lxc_attach(const char *name, const char *lxcpath,
 	struct lxc_proc_context_info *init_ctx;
 	struct lxc_terminal terminal;
 	struct lxc_conf *conf;
+	char *name, *lxcpath;
 	struct attach_clone_payload payload = {0};
 
 	ret = access("/proc/self/ns", X_OK);
@@ -1022,20 +1029,33 @@ int lxc_attach(const char *name, const char *lxcpath,
 		return -1;
 	}
 
+	if (!container)
+		return minus_one_set_errno(EINVAL);
+
+	if (!lxc_container_get(container))
+		return minus_one_set_errno(EINVAL);
+
+	name = container->name;
+	lxcpath = container->config_path;
+
 	if (!options)
 		options = &attach_static_default_options;
 
 	init_pid = lxc_cmd_get_init_pid(name, lxcpath);
 	if (init_pid < 0) {
 		ERROR("Failed to get init pid");
+		lxc_container_put(container);
 		return -1;
 	}
 
 	init_ctx = lxc_proc_get_context_info(init_pid);
 	if (!init_ctx) {
 		ERROR("Failed to get context of init process: %ld", (long)init_pid);
+		lxc_container_put(container);
 		return -1;
 	}
+
+	init_ctx->container = container;
 
 	personality = get_personality(name, lxcpath);
 	if (init_ctx->personality < 0) {
@@ -1044,12 +1064,6 @@ int lxc_attach(const char *name, const char *lxcpath,
 		return -1;
 	}
 	init_ctx->personality = personality;
-
-	init_ctx->container = lxc_container_new(name, lxcpath);
-	if (!init_ctx->container) {
-		lxc_proc_put_context_info(init_ctx);
-		return -1;
-	}
 
 	if (!init_ctx->container->lxc_conf) {
 		init_ctx->container->lxc_conf = lxc_conf_init();
@@ -1311,6 +1325,16 @@ int lxc_attach(const char *name, const char *lxcpath,
 			TRACE("Sent LSM label file descriptor %d to child", labelfd);
 		}
 
+		if (conf && conf->seccomp.seccomp) {
+			ret = lxc_seccomp_recv_notifier_fd(&conf->seccomp, ipc_sockets[0]);
+			if (ret < 0)
+				goto close_mainloop;
+
+			ret = lxc_seccomp_add_notifier(name, lxcpath, &conf->seccomp);
+			if (ret < 0)
+				goto close_mainloop;
+		}
+
 		/* We're done, the child process should now execute whatever it
 		 * is that the user requested. The parent can now track it with
 		 * waitpid() or similar.
@@ -1410,7 +1434,7 @@ int lxc_attach(const char *name, const char *lxcpath,
 	payload.exec_function = exec_function;
 	payload.exec_payload = exec_payload;
 
-	pid = lxc_raw_clone(CLONE_PARENT);
+	pid = lxc_raw_clone(CLONE_PARENT, NULL);
 	if (pid < 0) {
 		SYSERROR("Failed to clone attached process");
 		shutdown(ipc_sockets[1], SHUT_RDWR);

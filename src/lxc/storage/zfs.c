@@ -101,7 +101,7 @@ int zfs_get_parent_snapshot_exec_wrapper(void *args)
 {
 	struct zfs_args *zfs_args = args;
 
-	execlp("zfs", "zfs", "get", "origin", "-o", "value", "-H",
+	execlp("zfs", "zfs", "get", "-H", "-o", "value", "origin",
 	       zfs_args->dataset, (char *)NULL);
 
 	return -1;
@@ -427,7 +427,7 @@ bool zfs_snapshot(struct lxc_conf *conf, struct lxc_storage *orig,
 	if (ret < 0 || ret >= PATH_MAX) {
 		ERROR("Failed to create string");
 		free(snapshot);
-		return -1;
+		return false;
 	}
 
 	cmd_args.dataset = lxc_storage_get_path(new->src, new->type);

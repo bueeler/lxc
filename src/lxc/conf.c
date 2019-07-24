@@ -79,6 +79,7 @@
 #include "syscall_wrappers.h"
 #include "terminal.h"
 #include "utils.h"
+#include "uuid.h"
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -2763,6 +2764,7 @@ struct lxc_conf *lxc_conf_init(void)
 	new->init_gid = 0;
 	memset(&new->cgroup_meta, 0, sizeof(struct lxc_cgroup));
 	memset(&new->ns_share, 0, sizeof(char *) * LXC_NS_MAX);
+	seccomp_conf_init(new);
 
 	return new;
 }
@@ -3487,6 +3489,56 @@ static bool execveat_supported(void)
 	return true;
 }
 
+static int lxc_setup_boot_id(void)
+{
+	int ret;
+	const char *boot_id_path = "/proc/sys/kernel/random/boot_id";
+	const char *mock_boot_id_path = "/dev/.lxc-boot-id";
+	lxc_id128_t n;
+
+	if (access(boot_id_path, F_OK))
+		return 0;
+
+	memset(&n, 0, sizeof(n));
+	if (lxc_id128_randomize(&n)) {
+		SYSERROR("Failed to generate random data for uuid");
+		return -1;
+	}
+
+	ret = lxc_id128_write(mock_boot_id_path, n);
+	if (ret < 0) {
+		SYSERROR("Failed to write uuid to %s", mock_boot_id_path);
+		return -1;
+	}
+
+	ret = chmod(mock_boot_id_path, 0444);
+	if (ret < 0) {
+		SYSERROR("Failed to chown %s", mock_boot_id_path);
+		(void)unlink(mock_boot_id_path);
+		return -1;
+	}
+
+	ret = mount(mock_boot_id_path, boot_id_path, NULL, MS_BIND, NULL);
+	if (ret < 0) {
+		SYSERROR("Failed to mount %s to %s", mock_boot_id_path,
+			 boot_id_path);
+		(void)unlink(mock_boot_id_path);
+		return -1;
+	}
+
+	ret = mount(NULL, boot_id_path, NULL,
+		    (MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NOEXEC |
+		     MS_NODEV),
+		    NULL);
+	if (ret < 0) {
+		SYSERROR("Failed to remount %s read-only", boot_id_path);
+		(void)unlink(mock_boot_id_path);
+		return -1;
+	}
+
+	return 0;
+}
+
 int lxc_setup(struct lxc_handler *handler)
 {
 	int ret;
@@ -3511,16 +3563,19 @@ int lxc_setup(struct lxc_handler *handler)
 	if (ret < 0)
 		return -1;
 
-	ret = lxc_setup_network_in_child_namespaces(lxc_conf, &lxc_conf->network);
-	if (ret < 0) {
-		ERROR("Failed to setup network");
-		return -1;
-	}
+	if (handler->ns_clone_flags & CLONE_NEWNET) {
+		ret = lxc_setup_network_in_child_namespaces(lxc_conf,
+							    &lxc_conf->network);
+		if (ret < 0) {
+			ERROR("Failed to setup network");
+			return -1;
+		}
 
-	ret = lxc_network_send_name_and_ifindex_to_parent(handler);
-	if (ret < 0) {
-		ERROR("Failed to send network device names and ifindices to parent");
-		return -1;
+		ret = lxc_network_send_name_and_ifindex_to_parent(handler);
+		if (ret < 0) {
+			ERROR("Failed to send network device names and ifindices to parent");
+			return -1;
+		}
 	}
 
 	if (lxc_conf->autodev > 0) {
@@ -3644,6 +3699,10 @@ int lxc_setup(struct lxc_handler *handler)
 		return -1;
 	}
 
+	/* Setting the boot-id is best-effort for now. */
+	if (lxc_conf->autodev > 0)
+		(void)lxc_setup_boot_id();
+
 	ret = lxc_setup_devpts(lxc_conf);
 	if (ret < 0) {
 		ERROR("Failed to setup new devpts instance");
@@ -3698,29 +3757,14 @@ int run_lxc_hooks(const char *name, char *hookname, struct lxc_conf *conf,
 		  char *argv[])
 {
 	struct lxc_list *it;
-	int which = -1;
+	int which;
 
-	if (strcmp(hookname, "pre-start") == 0)
-		which = LXCHOOK_PRESTART;
-	else if (strcmp(hookname, "start-host") == 0)
-		which = LXCHOOK_START_HOST;
-	else if (strcmp(hookname, "pre-mount") == 0)
-		which = LXCHOOK_PREMOUNT;
-	else if (strcmp(hookname, "mount") == 0)
-		which = LXCHOOK_MOUNT;
-	else if (strcmp(hookname, "autodev") == 0)
-		which = LXCHOOK_AUTODEV;
-	else if (strcmp(hookname, "start") == 0)
-		which = LXCHOOK_START;
-	else if (strcmp(hookname, "stop") == 0)
-		which = LXCHOOK_STOP;
-	else if (strcmp(hookname, "post-stop") == 0)
-		which = LXCHOOK_POSTSTOP;
-	else if (strcmp(hookname, "clone") == 0)
-		which = LXCHOOK_CLONE;
-	else if (strcmp(hookname, "destroy") == 0)
-		which = LXCHOOK_DESTROY;
-	else
+	for (which = 0; which < NUM_LXC_HOOKS; which ++) {
+		if (strcmp(hookname, lxchook_names[which]) == 0)
+			break;
+	}
+
+	if (which >= NUM_LXC_HOOKS)
 		return -1;
 
 	lxc_list_for_each (it, &conf->hooks[which]) {
@@ -4066,7 +4110,7 @@ void lxc_conf_free(struct lxc_conf *conf)
 	free(conf->lsm_aa_profile);
 	free(conf->lsm_aa_profile_computed);
 	free(conf->lsm_se_context);
-	lxc_seccomp_free(conf);
+	lxc_seccomp_free(&conf->seccomp);
 	lxc_clear_config_caps(conf);
 	lxc_clear_config_keepcaps(conf);
 	lxc_clear_cgroups(conf, "lxc.cgroup", CGROUP_SUPER_MAGIC);
@@ -4336,7 +4380,7 @@ int userns_exec_1(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	d.p[1] = p[1];
 
 	/* Clone child in new user namespace. */
-	pid = lxc_raw_clone_cb(run_userns_fn, &d, CLONE_NEWUSER);
+	pid = lxc_raw_clone_cb(run_userns_fn, &d, CLONE_NEWUSER, NULL);
 	if (pid < 0) {
 		ERROR("Failed to clone process in new user namespace");
 		goto on_error;
@@ -4418,7 +4462,7 @@ int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	d.p[1] = p[1];
 
 	/* Clone child in new user namespace. */
-	pid = lxc_clone(run_userns_fn, &d, CLONE_NEWUSER);
+	pid = lxc_clone(run_userns_fn, &d, CLONE_NEWUSER, NULL);
 	if (pid < 0) {
 		ERROR("Failed to clone process in new user namespace");
 		goto on_error;

@@ -206,7 +206,28 @@ static char **get_groupnames(void)
 	}
 
 	for (i = 0; i < ngroups; i++) {
-		ret = getgrgid_r(group_ids[i], &grent, buf, bufsize, &grentp);
+		while ((ret = getgrgid_r(group_ids[i], &grent, buf, bufsize, &grentp)) == ERANGE) {
+			bufsize <<= 1;
+			if (bufsize > MAX_GRBUF_SIZE) {
+				usernic_error("Failed to get group members: %u\n",
+				      group_ids[i]);
+				free(buf);
+				free(group_ids);
+				free_groupnames(groupnames);
+				return NULL;
+			}
+			char *new_buf = realloc(buf, bufsize);
+			if (!new_buf) {
+				usernic_error("Failed to allocate memory while getting group "
+					      "names: %s\n",
+					      strerror(errno));
+				free(buf);
+				free(group_ids);
+				free_groupnames(groupnames);
+				return NULL;
+			}
+			buf = new_buf;
+		}
 		if (!grentp) {
 			if (ret == 0)
 				usernic_error("%s", "Could not find matched group record\n");
@@ -422,8 +443,8 @@ static char *find_line(char *buf_start, char *buf_end, char *name,
 
 		if (strncmp(buf_start, name, strlen(name)))
 			*found = false;
-
-		*owner = true;
+		else
+			*owner = true;
 
 		buf_start = end_of_word + 1;
 		while ((buf_start < buf_end) && isblank(*buf_start))

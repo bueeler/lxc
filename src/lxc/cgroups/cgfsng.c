@@ -320,6 +320,7 @@ static char *lxc_cpumask_to_cpulist(uint32_t *bitarr, size_t nbits)
 {
 	int ret;
 	size_t i;
+	char *tmp = NULL;
 	char **cpulist = NULL;
 	char numstr[INTTYPE_TO_STRLEN(size_t)] = {0};
 
@@ -343,7 +344,10 @@ static char *lxc_cpumask_to_cpulist(uint32_t *bitarr, size_t nbits)
 	if (!cpulist)
 		return NULL;
 
-	return lxc_string_join(",", (const char **)cpulist, false);
+	tmp = lxc_string_join(",", (const char **)cpulist, false);
+	lxc_free_array((void **)cpulist, free);
+
+	return tmp;
 }
 
 static ssize_t get_max_cpus(char *cpulist)
@@ -378,16 +382,18 @@ static ssize_t get_max_cpus(char *cpulist)
 }
 
 #define __ISOL_CPUS "/sys/devices/system/cpu/isolated"
+#define __OFFLINE_CPUS "/sys/devices/system/cpu/offline"
 static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 {
 	__do_free char *cpulist = NULL, *fpath = NULL, *isolcpus = NULL,
-		       *posscpus = NULL;
-	__do_free uint32_t *isolmask = NULL, *possmask = NULL;
+		       *offlinecpus = NULL, *posscpus = NULL;
+	__do_free uint32_t *isolmask = NULL, *offlinemask = NULL,
+			   *possmask = NULL;
 	int ret;
 	ssize_t i;
 	char oldv;
 	char *lastslash;
-	ssize_t maxisol = 0, maxposs = 0;
+	ssize_t maxisol = 0, maxoffline = 0, maxposs = 0;
 	bool bret = false, flipped_bit = false;
 
 	lastslash = strrchr(path, '/');
@@ -397,7 +403,9 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 	}
 	oldv = *lastslash;
 	*lastslash = '\0';
-	fpath = must_make_path(path, "cpus", NULL);
+	
+	fpath = must_make_path(path, "cpus", NULL);	
+	*lastslash = oldv;
 	posscpus = read_file(fpath);
 	if (!posscpus) {
 		SYSERROR("Failed to read file \"%s\"", fpath);
@@ -409,54 +417,52 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 	if (maxposs < 0 || maxposs >= INT_MAX - 1)
 		return false;
 
-	if (!file_exists(__ISOL_CPUS)) {
-		/* This system doesn't expose isolated cpus. */
-		DEBUG("The path \""__ISOL_CPUS"\" to read isolated cpus from does not exist");
-		/* No isolated cpus but we weren't already initialized by
-		 * someone. We should simply copy the parents cpuset.cpus
-		 * values.
-		 */
-		if (!am_initialized) {
-			DEBUG("Copying cpu settings of parent cgroup");
-			cpulist = posscpus;
-			goto copy_parent;
+	if (file_exists(__ISOL_CPUS)) {
+		isolcpus = read_file(__ISOL_CPUS);
+		if (!isolcpus) {
+			SYSERROR("Failed to read file \"%s\"", __ISOL_CPUS);
+			return false;
 		}
-		/* No isolated cpus but we were already initialized by someone.
-		 * Nothing more to do for us.
-		 */
-		return true;
-	}
 
-	isolcpus = read_file(__ISOL_CPUS);
-	if (!isolcpus) {
-		SYSERROR("Failed to read file \""__ISOL_CPUS"\"");
-		return false;
-	}
-	if (!isdigit(isolcpus[0])) {
-		TRACE("No isolated cpus detected");
-		/* No isolated cpus but we weren't already initialized by
-		 * someone. We should simply copy the parents cpuset.cpus
-		 * values.
-		 */
-		if (!am_initialized) {
-			DEBUG("Copying cpu settings of parent cgroup");
-			cpulist = posscpus;
-			goto copy_parent;
+		if (isdigit(isolcpus[0])) {
+			/* Get maximum number of cpus found in isolated cpuset. */
+			maxisol = get_max_cpus(isolcpus);
+			if (maxisol < 0 || maxisol >= INT_MAX - 1)
+				return false;
 		}
-		/* No isolated cpus but we were already initialized by someone.
-		 * Nothing more to do for us.
-		 */
-		return true;
+
+		if (maxposs < maxisol)
+			maxposs = maxisol;
+		maxposs++;
+	} else {
+		TRACE("The path \""__ISOL_CPUS"\" to read isolated cpus from does not exist");
 	}
 
-	/* Get maximum number of cpus found in isolated cpuset. */
-	maxisol = get_max_cpus(isolcpus);
-	if (maxisol < 0 || maxisol >= INT_MAX - 1)
-		return false;
+	if (file_exists(__OFFLINE_CPUS)) {
+		offlinecpus = read_file(__OFFLINE_CPUS);
+		if (!offlinecpus) {
+			SYSERROR("Failed to read file \"%s\"", __OFFLINE_CPUS);
+			return false;
+		}
 
-	if (maxposs < maxisol)
-		maxposs = maxisol;
-	maxposs++;
+		if (isdigit(offlinecpus[0])) {
+			/* Get maximum number of cpus found in offline cpuset. */
+			maxoffline = get_max_cpus(offlinecpus);
+			if (maxoffline < 0 || maxoffline >= INT_MAX - 1)
+				return false;
+		}
+
+		if (maxposs < maxoffline)
+			maxposs = maxoffline;
+		maxposs++;
+	} else {
+		TRACE("The path \""__OFFLINE_CPUS"\" to read offline cpus from does not exist");
+	}
+
+	if ((maxisol == 0) && (maxoffline == 0)) {
+		cpulist = move_ptr(posscpus);
+		goto copy_parent;
+	}
 
 	possmask = lxc_cpumask(posscpus, maxposs);
 	if (!possmask) {
@@ -464,14 +470,26 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 		return false;
 	}
 
-	isolmask = lxc_cpumask(isolcpus, maxposs);
-	if (!isolmask) {
-		ERROR("Failed to create cpumask for isolated cpus");
-		return false;
+	if (maxisol > 0) {
+		isolmask = lxc_cpumask(isolcpus, maxposs);
+		if (!isolmask) {
+			ERROR("Failed to create cpumask for isolated cpus");
+			return false;
+		}
+	}
+
+	if (maxoffline > 0) {
+		offlinemask = lxc_cpumask(offlinecpus, maxposs);
+		if (!offlinemask) {
+			ERROR("Failed to create cpumask for offline cpus");
+			return false;
+		}
 	}
 
 	for (i = 0; i <= maxposs; i++) {
-		if (!is_set(i, isolmask) || !is_set(i, possmask))
+		if ((isolmask && !is_set(i, isolmask)) ||
+		    (offlinemask && !is_set(i, offlinemask)) ||
+		    !is_set(i, possmask))
 			continue;
 
 		flipped_bit = true;
@@ -479,10 +497,10 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 	}
 
 	if (!flipped_bit) {
-		DEBUG("No isolated cpus present in cpuset");
+		DEBUG("No isolated or offline cpus present in cpuset");
 		return true;
 	}
-	DEBUG("Removed isolated cpus from cpuset");
+	DEBUG("Removed isolated or offline cpus from cpuset");
 
 	cpulist = lxc_cpumask_to_cpulist(possmask, maxposs);
 	if (!cpulist) {
@@ -491,14 +509,16 @@ static bool cg_legacy_filter_and_set_cpus(char *path, bool am_initialized)
 	}
 
 copy_parent:
-	*lastslash = oldv;
-	fpath = must_make_path(path, "cpus", NULL);
-	ret = lxc_write_to_file(fpath, cpulist, strlen(cpulist), false, 0666);
-	if (cpulist == posscpus)
-		cpulist = NULL;
-	if (ret < 0) {
-		SYSERROR("Failed to write cpu list to \"%s\"", fpath);
-		return false;
+	if (!am_initialized) {
+		fpath = must_make_path(path, "cpus", NULL);
+		ret = lxc_write_to_file(fpath, cpulist, strlen(cpulist), false,
+					0666);
+		if (ret < 0) {
+			SYSERROR("Failed to write cpu list to \"%s\"", fpath);
+			return false;
+		}
+
+		TRACE("Copied cpu settings of parent cgroup");
 	}
 
 	return true;
@@ -593,10 +613,8 @@ static bool cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
 	}
 
 	/* Already set for us by someone else. */
-	if (v == '1') {
-		DEBUG("\"cgroup.clone_children\" was already set to \"1\"");
-		return true;
-	}
+	if (v == '1')
+		TRACE("\"cgroup.clone_children\" was already set to \"1\"");
 
 	/* copy parent's settings */
 	if (!copy_parent_file(cgpath, "mems")) {
@@ -1527,7 +1545,7 @@ static int chowmod(char *path, uid_t chown_uid, gid_t chown_gid,
  */
 static int chown_cgroup_wrapper(void *data)
 {
-	int i, ret;
+	int ret;
 	uid_t destuid;
 	struct generic_userns_exec_data *arg = data;
 	uid_t nsuid = (arg->conf->root_nsuid_map != NULL) ? 0 : arg->conf->init_uid;
@@ -1557,7 +1575,7 @@ static int chown_cgroup_wrapper(void *data)
 	if (destuid == LXC_INVALID_UID)
 		destuid = 0;
 
-	for (i = 0; arg->hierarchies[i]; i++) {
+	for (int i = 0; arg->hierarchies[i]; i++) {
 		__do_free char *fullpath = NULL;
 		char *path = arg->hierarchies[i]->container_full_path;
 
@@ -1696,10 +1714,10 @@ static int cg_legacy_mount_controllers(int type, struct hierarchy *h,
 static int __cg_mount_direct(int type, struct hierarchy *h,
 			     const char *controllerpath)
 {
-	 int ret;
 	 __do_free char *controllers = NULL;
 	 char *fstype = "cgroup2";
 	 unsigned long flags = 0;
+	 int ret;
 
 	 flags |= MS_NOSUID;
 	 flags |= MS_NOEXEC;
@@ -1746,7 +1764,7 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
 					const char *root, int type)
 {
 	__do_free char *tmpfspath = NULL;
-	int i, ret;
+	int ret;
 	bool has_cgns = false, retval = false, wants_force_mount = false;
 
 	if (!ops->hierarchies)
@@ -1784,7 +1802,7 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
 	if (ret < 0)
 		goto on_error;
 
-	for (i = 0; ops->hierarchies[i]; i++) {
+	for (int i = 0; ops->hierarchies[i]; i++) {
 		__do_free char *controllerpath = NULL, *path2 = NULL;
 		struct hierarchy *h = ops->hierarchies[i];
 		char *controller = strrchr(h->mountpoint, '/');
@@ -1879,26 +1897,22 @@ static int recursive_count_nrtasks(char *dirname)
 __cgfsng_ops static int cgfsng_nrtasks(struct cgroup_ops *ops)
 {
 	__do_free char *path = NULL;
-	int count;
 
 	if (!ops->container_cgroup || !ops->hierarchies)
 		return -1;
 
 	path = must_make_path(ops->hierarchies[0]->container_full_path, NULL);
-	count = recursive_count_nrtasks(path);
-	return count;
+	return recursive_count_nrtasks(path);
 }
 
 /* Only root needs to escape to the cgroup of its init. */
 __cgfsng_ops static bool cgfsng_escape(const struct cgroup_ops *ops,
 					 struct lxc_conf *conf)
 {
-	int i;
-
 	if (conf->cgroup_meta.relative || geteuid() || !ops->hierarchies)
 		return true;
 
-	for (i = 0; ops->hierarchies[i]; i++) {
+	for (int i = 0; ops->hierarchies[i]; i++) {
 		int ret;
 		__do_free char *fullpath = NULL;
 
@@ -2067,7 +2081,7 @@ on_error:
 __cgfsng_ops static bool cgfsng_attach(struct cgroup_ops *ops, const char *name,
 					 const char *lxcpath, pid_t pid)
 {
-	int i, len, ret;
+	int len, ret;
 	char pidstr[INTTYPE_TO_STRLEN(pid_t)];
 
 	if (!ops->hierarchies)
@@ -2077,9 +2091,8 @@ __cgfsng_ops static bool cgfsng_attach(struct cgroup_ops *ops, const char *name,
 	if (len < 0 || (size_t)len >= sizeof(pidstr))
 		return false;
 
-	for (i = 0; ops->hierarchies[i]; i++) {
-		__do_free char *path = NULL;
-		char *fullpath = NULL;
+	for (int i = 0; ops->hierarchies[i]; i++) {
+		__do_free char *fullpath = NULL, *path = NULL;
 		struct hierarchy *h = ops->hierarchies[i];
 
 		if (h->version == CGROUP2_SUPER_MAGIC) {
@@ -2377,13 +2390,10 @@ static bool __cg_unified_setup_limits(struct cgroup_ops *ops,
 }
 
 __cgfsng_ops static bool cgfsng_setup_limits(struct cgroup_ops *ops,
-					       struct lxc_conf *conf,
-					       bool do_devices)
+					     struct lxc_conf *conf,
+					     bool do_devices)
 {
-	bool bret;
-
-	bret = __cg_legacy_setup_limits(ops, &conf->cgroup, do_devices);
-	if (!bret)
+	if (!__cg_legacy_setup_limits(ops, &conf->cgroup, do_devices))
 		return false;
 
 	return __cg_unified_setup_limits(ops, &conf->cgroup2);
@@ -2392,15 +2402,13 @@ __cgfsng_ops static bool cgfsng_setup_limits(struct cgroup_ops *ops,
 static bool cgroup_use_wants_controllers(const struct cgroup_ops *ops,
 				       char **controllers)
 {
-	char **cur_ctrl, **cur_use;
-
 	if (!ops->cgroup_use)
 		return true;
 
-	for (cur_ctrl = controllers; cur_ctrl && *cur_ctrl; cur_ctrl++) {
+	for (char **cur_ctrl = controllers; cur_ctrl && *cur_ctrl; cur_ctrl++) {
 		bool found = false;
 
-		for (cur_use = ops->cgroup_use; cur_use && *cur_use; cur_use++) {
+		for (char **cur_use = ops->cgroup_use; cur_use && *cur_use; cur_use++) {
 			if (strcmp(*cur_use, *cur_ctrl) != 0)
 				continue;
 
@@ -2735,7 +2743,7 @@ __cgfsng_ops static bool cgfsng_data_init(struct cgroup_ops *ops)
 
 struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
 {
-	struct cgroup_ops *cgfsng_ops;
+	__do_free struct cgroup_ops *cgfsng_ops = NULL;
 
 	cgfsng_ops = malloc(sizeof(struct cgroup_ops));
 	if (!cgfsng_ops)
@@ -2744,10 +2752,8 @@ struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
 	memset(cgfsng_ops, 0, sizeof(struct cgroup_ops));
 	cgfsng_ops->cgroup_layout = CGROUP_LAYOUT_UNKNOWN;
 
-	if (!cg_init(cgfsng_ops, conf)) {
-		free(cgfsng_ops);
+	if (!cg_init(cgfsng_ops, conf))
 		return NULL;
-	}
 
 	cgfsng_ops->data_init = cgfsng_data_init;
 	cgfsng_ops->payload_destroy = cgfsng_payload_destroy;
@@ -2771,5 +2777,5 @@ struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
 	cgfsng_ops->mount = cgfsng_mount;
 	cgfsng_ops->nrtasks = cgfsng_nrtasks;
 
-	return cgfsng_ops;
+	return move_ptr(cgfsng_ops);
 }

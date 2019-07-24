@@ -375,7 +375,7 @@ static void exec_criu(struct cgroup_ops *cgroup_ops, struct lxc_conf *conf,
 	}
 
 	if (opts->user->verbose)
-		DECLARE_ARG("-vvvvvv");
+		DECLARE_ARG("-v4");
 
 	if (opts->user->action_script) {
 		DECLARE_ARG("--action-script");
@@ -1273,7 +1273,6 @@ static bool do_dump(struct lxc_container *c, char *mode, struct migrate_opts *op
 		if (!cgroup_ops) {
 			ERROR("failed to cgroup_init()");
 			_exit(EXIT_FAILURE);
-			return -1;
 		}
 
 		os.pipefd = criuout[1];
